@@ -228,3 +228,43 @@ def refine_pipe_segments(ix, vox, vn, cid, cdist, floor_z, cfg, rng, vlabels, in
             vlabels[jx] = 4; instance[jx] = next_inst; next_inst += 1
     return next_inst
 
+# 7. DETECCIÓN DE PISO Y TECHO ================================================
+
+def detect_floor_ceiling(xyz, normals, config):
+    """Detecta piso(s) por picos de altura y cobertura XY; el techo es el pico superior."""
+    axis=config["UP_AXIS"]; z=xyz[:,axis]; nz=np.abs(normals[:,axis])
+    cand=nz>=config["NORMAL_UP"]
+    if cand.sum()<max(100,int(.005*len(xyz))): cand=np.ones(len(xyz),bool)
+    bw=config["HIST_BIN"]
+    edges=np.arange(z.min()-2*bw,z.max()+3*bw,bw)
+    hist,_=np.histogram(z[cand],bins=edges)
+    smooth=np.convolve(hist,np.ones(3),mode="same")
+    peaks,_=find_peaks(smooth, distance=max(1,int(.30/bw)))
+    if len(peaks)<2: peaks=np.argsort(smooth)[-min(2,len(smooth)):]
+    peaks=sorted(peaks,key=lambda i:smooth[i],reverse=True)
+    centers=(edges[:-1]+edges[1:])/2
+
+    chosen=sorted(peaks[:min(6,len(peaks))],key=lambda i:centers[i])
+    ceil_z=float(centers[chosen[-1]])
+    horizontal=nz>=config["NORMAL_UP"]
+    ax=[i for i in range(3) if i!=axis]; floor_levels=[]
+    for pi in peaks:
+        level=float(centers[pi])
+        if level>=ceil_z-config["CEILING_BAND"]: continue
+        near=(np.abs(z-level)<=config["FLOOR_BAND"]) & horizontal
+        if near.sum()<max(100,int(.003*len(xyz))): continue
+        xy=xyz[near][:,ax]; cell=config["FLOOR_LEVEL_GRID"]
+        ij=np.floor((xy-xy.min(0))/cell).astype(int); shape=ij.max(0)+1
+        occupied=np.zeros(shape,dtype=bool); occupied[ij[:,0],ij[:,1]]=True
+        if occupied.mean()>=config["FLOOR_LEVEL_MIN_OCCUPANCY"]:
+            floor_levels.append(level)
+    if not floor_levels:
+        floor_levels=[float(centers[chosen[0]])]
+    floor_z=float(min(floor_levels))
+    # Solo el nivel más bajo se asigna por altura global. Los pisos elevados
+    # deben pasar RANSAC y las pruebas de área/cobertura para no absorber tuberías.
+    floor=(np.abs(z-floor_z)<=config["FLOOR_BAND"]) & horizontal
+    ceiling=(np.abs(z-ceil_z)<=config["CEILING_BAND"]) & horizontal & ~floor
+    if floor_z>=ceil_z: warnings.warn("No se detectó piso por debajo del techo; revisar ejes y bandas.")
+    return floor,ceiling,floor_z,ceil_z,np.asarray(floor_levels,float)
+
