@@ -372,3 +372,59 @@ def cluster_residual(points, normals, config, rng):
             labels=new
     return labels,eps
 
+# 10. CARACTERÍSTICAS GEOMÉTRICAS Y REGLAS ====================================
+
+def cylinder_check(points,normals,config,rng):
+    """Ajuste circular RANSAC en plano perpendicular al eje PCA principal."""
+    n=len(points)
+    if n<30: return {"ok":False,"ratio":0.,"radius":None}
+    ids=rng.choice(n,min(n,config["CYLINDER_MAX_POINTS"]),replace=False)
+    p=points[ids]; nn=normals[ids]
+    n=len(p)
+    _,_,vh=np.linalg.svd(p-p.mean(axis=0),full_matrices=False); axis=vh[0]
+    ref=np.array([1.,0,0]) if abs(axis[0])<.9 else np.array([0.,1,0])
+    u=np.cross(axis,ref); u/=np.linalg.norm(u); v=np.cross(axis,u)
+    q=np.column_stack(((p-p.mean(axis=0))@u,(p-p.mean(axis=0))@v))
+    qn=np.column_stack((nn@u,nn@v)); best=0; best_r=None
+    trials=min(config["CYLINDER_TRIALS"],max(20,n//10))
+    for _ in range(trials):
+        ii=rng.choice(n,3,replace=False); a,b,c=q[ii]
+        mat=2*np.array([b-a,c-a]); det=np.linalg.det(mat)
+        if abs(det)<1e-8: continue
+        center=np.linalg.solve(mat,np.array([b@b-a@a,c@c-a@a])); radius=np.linalg.norm(a-center)
+        if not config["CYLINDER_RADIUS_MIN"]<=radius<=config["CYLINDER_RADIUS_MAX"]: continue
+        radial=q-center; rr=np.linalg.norm(radial,axis=1)
+        agree=np.abs(np.sum((radial/np.maximum(rr[:,None],1e-9))*qn,axis=1))>.65
+        inside=(np.abs(rr-radius)<max(.025,config["VOXEL"]*1.5)) & agree
+        count=int(inside.sum())
+        if count>best:
+            angles=np.sort(np.mod(np.arctan2(radial[inside,1],radial[inside,0]),2*np.pi))
+            if len(angles)<4: continue
+            max_gap=float(np.degrees(np.max(np.diff(np.r_[angles,angles[0]+2*np.pi]))))
+            if max_gap>config["CYLINDER_MAX_ANGULAR_GAP"]: continue
+            best=count; best_r=float(radius)
+    ratio=best/n
+    return {"ok":ratio>=config["CYLINDER_INLIER_RATIO"],"ratio":ratio,"radius":best_r}
+
+def cluster_features(points,normals,floor_z,config,rng):
+    center=points.mean(axis=0); cov=np.cov(points-center,rowvar=False) if len(points)>2 else np.eye(3)*1e-9
+    eig,vec=np.linalg.eigh(cov); order=np.argsort(eig)[::-1]; eig=np.maximum(eig[order],1e-12); vec=vec[:,order]
+    linear=float((eig[0]-eig[1])/eig[0]); planar=float((eig[1]-eig[2])/eig[0]); spherical=float(eig[2]/eig[0])
+    extent=np.ptp(points,axis=0); up=config["UP_AXIS"]
+    other=[i for i in range(3) if i!=up]; footprint=float(extent[other[0]]*extent[other[1]])
+    base=float(points[:,up].min()-floor_z); height=float(extent[up]); vertical=float(abs(vec[up,0]))
+    elongated=linear>=config["ELONGATED_LINEARITY"]
+    cyl=cylinder_check(points,normals,config,rng) if linear>=config["PIPE_CHECK_LINEARITY"] else {"ok":False,"ratio":0.,"radius":None}
+    return {"linearidad":linear,"planaridad":planar,"esfericidad":spherical,"verticalidad":vertical,
+            "extensiones":extent,"huella":footprint,"altura":height,"base_piso":base,
+            "elongado":elongated,"cilindro":cyl}
+
+def classify_features(f,config):
+    if f["planaridad"]>=config["WALL_PLANARITY"] and f["verticalidad"]>=config["WALL_VERTICALITY"]: return 8
+    if f["elongado"] and f["verticalidad"]>=config["COLUMN_VERTICALITY"]: return 3
+    if f["cilindro"]["ok"] and f["verticalidad"]<config["COLUMN_VERTICALITY"]: return 4
+    if f["elongado"]: return 5
+    if config["PERSON_HEIGHT_MIN"]<=f["altura"]<=config["PERSON_HEIGHT_MAX"] and f["huella"]<=config["PERSON_FOOTPRINT_MAX"] and f["base_piso"]<=config["PERSON_BASE_MAX"]: return 6
+    if f["huella"]>=config["MACHINE_FOOTPRINT_MIN"] and f["altura"]<=config["MACHINE_HEIGHT_MAX"] and f["base_piso"]<=config["MACHINE_BASE_MAX"]: return 7
+    return 8
+
