@@ -1,0 +1,101 @@
+{
+  "points": 1647021,
+  "points_per_class": {
+    "piso": 425146,
+    "techo": 139371,
+    "columna": 327096,
+    "tuberia": 133816,
+    "viga": 271972,
+    "persona": 6020,
+    "maquina_vehiculo": 66909,
+    "otro": 276691
+  },
+  "percent_unassigned": 0.0,
+  "cluster_size_distribution": {
+    "min": 7,
+    "median": 150.0,
+    "max": 105744
+  },
+  "tiny_segments": 1,
+  "columns_detected": 20,
+  "floor_z": -1.6339056015014677,
+  "floor_levels": [
+    -1.6339056015014677,
+    2.966094398498516
+  ],
+  "ceiling_z": 8.966094398498495,
+  "floor_pipe_reassigned": 14,
+  "adaptive_eps": 0.19296866628691756,
+  "self_consistency": {
+    "porcentaje_vecinos_mayoria_otra_clase": 2.236,
+    "porcentaje_sin_asignar": 0.0,
+    "segmentos_pequenos": 0,
+    "floor_below_ceiling": true,
+    "floor_far_above_level": true
+  },
+  "timings": [
+    {
+      "etapa": "0_voxel",
+      "segundos": 6.93928010000036,
+      "puntos": 1647021,
+      "puntos_segundo": 237347.53119418173
+    },
+    {
+      "etapa": "atributos_voxel",
+      "segundos": 0.9294778000003134,
+      "puntos": 1041806,
+      "puntos_segundo": 1120850.8691650825
+    },
+    {
+      "etapa": "normales",
+      "segundos": 4.638331500000277,
+      "puntos": 1041806,
+      "puntos_segundo": 224607.92205126732
+    },
+    {
+      "etapa": "color_meanshift",
+      "segundos": 5.78342370000064,
+      "puntos": 1041806,
+      "puntos_segundo": 180136.55129571172
+    },
+    {
+      "etapa": "1_piso_techo",
+      "segundos": 0.3000324000004184,
+      "puntos": 1041806,
+      "puntos_segundo": 3472311.657002867
+    },
+    {
+      "etapa": "1b_columnas",
+      "segundos": 0.14824339999995573,
+      "puntos": 750207,
+      "puntos_segundo": 5060643.509257236
+    },
+    {
+      "etapa": "2_planos_ransac",
+      "segundos": 1.8569906000002447,
+      "puntos": 588986,
+      "puntos_segundo": 317172.3109421891
+    },
+    {
+      "etapa": "3_residuo_cluster",
+      "segundos": 2.732767000000422,
+      "puntos": 484365,
+      "puntos_segundo": 177243.4312914073
+    },
+    {
+      "etapa": "total",
+      "segundos": 36.20664149999993,
+      "puntos": 1647021,
+      "puntos_segundo": 45489.46960791585
+    }
+  ],
+  "config": {
+    "VOXEL": 0.05,
+    "ETA": 1.5,
+    "DBSCAN_MIN": 3,
+    "GIANT_FRACTION": 0.5,
+    "GIANT_ETA_FACTOR": 0.7,
+    "RESIDUAL_METHOD": "dbscan"
+  },
+  "validation": "Reglas geométricas; no validado contra ground truth."
+}

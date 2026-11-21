@@ -1,3 +1,5 @@
+# FASE 1 - CLASIFICACIÓN GEOMÉTRICA ==========================================
+
 # 1. DEPENDENCIAS E IMPORTACIONES =============================================
 
 from pathlib import Path
@@ -11,15 +13,15 @@ from sklearn.cluster import DBSCAN, KMeans, MeanShift, estimate_bandwidth
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
 from sklearn.mixture import GaussianMixture
-import matplotlib.pyplot as plt
+from preview_renderer import render_preview
 
 # 2. CONFIGURACIÓN DEL PIPELINE ===============================================
 
 _HERE = Path(__file__).resolve().parent
 CONFIG = {
-    "PLY_PATH": os.environ.get("PLY_PATH", str(_HERE / "fábrica.ply")),
+    "PLY_PATH": os.environ.get("PLY_PATH", str(_HERE / "fabrica_puntos.ply")),
     "OUTPUT_DIR": os.environ.get("OUT_DIR", str(_HERE / "results")),
-    "MAX_POINTS": 823_510,
+    "MAX_POINTS": None,
     "SEED": 42, "VOXEL": 0.05, "USE_FILE_NORMALS": True, "USE_RGB": True,
     "UP_AXIS": 2, "HIST_BIN": 0.05, "NORMAL_UP": 0.90,
     "FLOOR_BAND": 0.15, "CEILING_BAND": 0.30,
@@ -37,9 +39,6 @@ CONFIG = {
     "PERSON_FOOTPRINT_MAX": 1.20, "PERSON_BASE_MAX": 0.35,
     "MACHINE_FOOTPRINT_MIN": 1.50, "MACHINE_HEIGHT_MAX": 3.50,
     "MACHINE_BASE_MAX": 0.50,
-    # Comparación visual; ROI manual opcional en coordenadas XYZ (metros).
-    "COMPARE_MAX_POINTS": 180_000, "COMPARE_PERSON_ROI": None,
-    "COMPARE_CROP_MARGIN": 0.60,
     "FLOOR_PLANE_MIN_SIDE": 1.50, "FLOOR_PLANE_MIN_AREA": 5.0,
     "FLOOR_PLANE_GRID": 0.30, "FLOOR_PLANE_MIN_OCCUPANCY": 0.12,
     "FLOOR_PLANE_QUADRANT_SUPPORT": 1,
@@ -577,7 +576,7 @@ def export_results(xyz,result,config):
     labels=result["labels"]; inst=result["instance_id"]
     color=class_colors(labels)
     pc=o3d.geometry.PointCloud(o3d.utility.Vector3dVector(xyz)); pc.colors=o3d.utility.Vector3dVector(color)
-    o3d.io.write_point_cloud(str(out/"ply_by_class.ply"),pc,write_ascii=False)
+    o3d.io.write_point_cloud(str(out/"fase1_clasificacion.ply"),pc,write_ascii=False)
     counts={CLASS_NAMES[c]:int(np.sum(labels==c)) for c in CLASS_NAMES}
     sizes=np.unique(inst[inst>=0],return_counts=True)[1] if np.any(inst>=0) else np.array([],int)
     stats={"points":len(xyz),"points_per_class":counts,"percent_unassigned":float(np.mean(labels<0)*100),
@@ -590,7 +589,7 @@ def export_results(xyz,result,config):
                      "RESIDUAL_METHOD":config["RESIDUAL_METHOD"]},
            "validation":"Reglas geométricas; no validado contra ground truth."}
 
-    (out/"stats.json").write_text(json.dumps(stats,ensure_ascii=False,indent=2),encoding="utf-8")
+    (out/"fase1_estadisticas.json").write_text(json.dumps(stats,ensure_ascii=False,indent=2),encoding="utf-8")
     return out,stats
 
 
@@ -626,116 +625,17 @@ for row in TIMINGS: print(f"{row['etapa']:<28} {row['segundos']:>8.2f} {row['pun
 print("\nPuntos por clase:")
 for k, v in STATS["points_per_class"].items(): print(f"  {k:<18}{v:>10,}  {100*v/len(_xyz):5.1f}%")
 
-# 14. COMPARACIÓN VISUAL ORIGINAL / CLASIFICACIÓN =============================
+PREVIEW_PATH = Path(OUT) / "fase1_comparacion.png"
+preview_rgb = np.rint(class_colors(RESULT["labels"]) * 255).astype(np.uint8)
+preview_classes = {
+    CLASS_NAMES[class_id]: tuple(np.rint(COLORS[class_id] * 255).astype(np.uint8))
+    for class_id in CLASS_NAMES
+}
+if np.any(RESULT["labels"] < 0):
+    preview_classes["sin asignar"] = (51, 51, 51)
+render_preview(
+    _xyz, preview_rgb, preview_classes,
+    f"Clasificación geométrica — {len(_xyz):,} puntos", PREVIEW_PATH,
+)
+print("Comparación:", PREVIEW_PATH)
 
-def _camera_basis(view_direction, up_axis):
-    up=np.eye(3)[up_axis].astype(float)
-    direction=np.asarray(view_direction,dtype=float); direction/=np.linalg.norm(direction)
-    right=np.cross(direction,up)
-    if np.linalg.norm(right)<1e-8: right=np.eye(3)[(up_axis+1)%3]
-    right/=np.linalg.norm(right)
-    camera_up=np.cross(right,direction); camera_up/=np.linalg.norm(camera_up)
-    return right,camera_up,direction
-
-def _project(points,basis):
-    right,camera_up,depth=basis
-    return points@right,points@camera_up,points@depth
-
-def _auto_crop(points,labels,instances,class_id,margin):
-    candidates=np.flatnonzero(labels==class_id)
-    if not len(candidates): return None
-    ids=instances[candidates]; ids=ids[ids>=0]
-    if len(ids):
-        inst_id,count=np.unique(ids,return_counts=True)
-        candidates=candidates[instances[candidates]==int(inst_id[np.argmax(count)])]
-    lo=points[candidates].min(0); hi=points[candidates].max(0)
-    pad=np.maximum(margin,np.maximum(hi-lo,0.25)*0.20)
-    return np.column_stack((lo-pad,hi+pad))
-
-def _manual_roi_mask(points,roi):
-    if roi is None: return None
-    try: bounds=np.asarray([roi[axis] for axis in ("x","y","z")],dtype=float)
-    except (KeyError,TypeError,ValueError) as exc:
-        raise ValueError('COMPARE_PERSON_ROI debe tener formato {"x":[min,max],"y":[min,max],"z":[min,max]}.') from exc
-    if bounds.shape!=(3,2) or not np.isfinite(bounds).all() or np.any(bounds[:,0]>=bounds[:,1]):
-        raise ValueError("COMPARE_PERSON_ROI requiere límites XYZ finitos, crecientes y en metros.")
-    return np.all((points>=bounds[:,0])&(points<=bounds[:,1]),axis=1)
-
-def _view_specs(up_axis):
-    horizontal=[i for i in range(3) if i!=up_axis]; x_axis,y_axis=horizontal
-    specs=[]
-    for angle,name in zip((45,135,225,315),("Esquina XY +/+","Esquina XY -/+","Esquina XY -/-","Esquina XY +/-")):
-        az=np.radians(angle); elev=np.radians(30)
-        direction=(np.cos(az)*np.eye(3)[x_axis]+np.sin(az)*np.eye(3)[y_axis])*np.cos(elev)+np.eye(3)[up_axis]*np.sin(elev)
-        specs.append((name,direction))
-    for angle,name in zip((0,90,180,270),("Lateral +X","Lateral +Y","Lateral -X","Lateral -Y")):
-        az=np.radians(angle); direction=np.cos(az)*np.eye(3)[x_axis]+np.sin(az)*np.eye(3)[y_axis]
-        specs.append((name,direction))
-    specs.extend((("Superior",np.eye(3)[up_axis]),("Inferior",-np.eye(3)[up_axis])))
-    return specs
-
-def render_comparison(xyz,rgb,labels,instances,path,config):
-    """Compara original y clases en diez cámaras comunes y dos acercamientos."""
-    if len(xyz)!=len(labels) or len(xyz)!=len(instances):
-        raise ValueError("XYZ, etiquetas e instancias deben contener el mismo número de puntos.")
-    rng=np.random.default_rng(config["SEED"])
-    common=rng.choice(len(xyz),min(config["COMPARE_MAX_POINTS"],len(xyz)),replace=False)
-    points=xyz[common]
-    original=(np.tile([0.68,0.68,0.68],(len(common),1)) if rgb is None else np.clip(rgb[common],0,1))
-    classified=class_colors(labels[common]); up=config["UP_AXIS"]
-
-    roi=config.get("COMPARE_PERSON_ROI"); manual=_manual_roi_mask(xyz,roi)
-    if manual is not None:
-        person_ix=np.flatnonzero(manual); person_title="Personas — recorte XYZ manual"
-    else:
-        box=_auto_crop(xyz,labels,instances,5,config["COMPARE_CROP_MARGIN"])
-        person_ix=np.empty(0,int) if box is None else np.flatnonzero(np.all((xyz>=box[:,0])&(xyz<=box[:,1]),axis=1))
-        person_title="Personas — mayor instancia detectada"
-    pipe_box=_auto_crop(xyz,labels,instances,3,config["COMPARE_CROP_MARGIN"])
-    pipe_ix=np.empty(0,int) if pipe_box is None else np.flatnonzero(np.all((xyz>=pipe_box[:,0])&(xyz<=pipe_box[:,1]),axis=1))
-
-    fig,axs=plt.subplots(6,4,figsize=(18,25),facecolor="white",squeeze=False)
-    for view_ix,(name,direction) in enumerate(_view_specs(up)):
-        basis=_camera_basis(direction,up); px,py,depth=_project(points,basis); order=np.argsort(depth)
-        for panel,colors,title in ((0,original,"Original (RGB)"),(1,classified,"Clasificación")):
-            ax=axs[view_ix//2,(view_ix%2)*2+panel]
-            ax.scatter(px[order],py[order],c=colors[order],s=0.28,marker=".",linewidths=0,rasterized=True)
-            ax.set_aspect("equal",adjustable="box"); ax.axis("off"); ax.set_title(title,fontsize=8)
-            padx=max(float(np.ptp(px))*0.025,0.02); pady=max(float(np.ptp(py))*0.025,0.02)
-            ax.set_xlim(float(px.min()-padx),float(px.max()+padx)); ax.set_ylim(float(py.min()-pady),float(py.max()+pady))
-        axs[view_ix//2,(view_ix%2)*2].text(0.02,0.98,name,transform=axs[view_ix//2,(view_ix%2)*2].transAxes,
-                                             va="top",ha="left",fontsize=9,bbox={"facecolor":"white","alpha":0.8,"edgecolor":"none","pad":2})
-
-    crops=((person_title,person_ix),("Tuberías — mayor instancia detectada",pipe_ix))
-    for crop_ix,(title,indices) in enumerate(crops):
-        left=crop_ix*2; ax_l,ax_r=axs[5,left],axs[5,left+1]
-        if len(indices):
-            p=xyz[indices]; c0=np.tile([0.68,0.68,0.68],(len(indices),1)) if rgb is None else np.clip(rgb[indices],0,1)
-            c1=class_colors(labels[indices]); basis=_camera_basis(np.eye(3)[up],up)
-            px,py,depth=_project(p,basis); order=np.argsort(depth)
-            for ax,colors,label in ((ax_l,c0,"Original (RGB)"),(ax_r,c1,"Clasificación")):
-                ax.scatter(px[order],py[order],c=colors[order],s=1.2,marker=".",linewidths=0,rasterized=True)
-                ax.set_aspect("equal",adjustable="box"); ax.axis("off"); ax.set_title(label,fontsize=9)
-                padx=max(float(np.ptp(px))*0.06,0.02); pady=max(float(np.ptp(py))*0.06,0.02)
-                ax.set_xlim(float(px.min()-padx),float(px.max()+padx)); ax.set_ylim(float(py.min()-pady),float(py.max()+pady))
-        else:
-            for ax,label in ((ax_l,"Original (RGB)"),(ax_r,"Clasificación")):
-                ax.axis("off"); ax.set_title(label,fontsize=9); ax.text(0.5,0.5,"Sin puntos para mostrar",ha="center",va="center",transform=ax.transAxes)
-        ax_l.text(0.02,0.98,title,transform=ax_l.transAxes,va="top",ha="left",fontsize=9,
-                  bbox={"facecolor":"white","alpha":0.85,"edgecolor":"none","pad":2})
-        if crop_ix==0 and roi is None and not len(indices):
-            ax_r.text(0.05,0.80,"No se detectaron personas.\nConfigura COMPARE_PERSON_ROI para inspeccionar\nla esquina manualmente.",transform=ax_r.transAxes,va="top",fontsize=8)
-    handles=[plt.Line2D([0],[0],marker="o",ls="",color=COLORS[c],
-                        label=f"{CLASS_NAMES[c]} ({np.sum(labels==c):,} puntos)")
-             for c in CLASS_NAMES if np.any(labels==c)]
-    if np.any(labels<0):
-        handles.append(plt.Line2D([0],[0],marker="o",ls="",color=(.2,.2,.2),
-                                  label=f"sin asignar ({np.sum(labels<0):,} puntos)"))
-    fig.legend(handles=handles,loc="lower center",ncol=4,fontsize=8,frameon=False)
-    fig.suptitle(f"Comparación PLY original / clasificación — {len(xyz):,} puntos; muestra común {len(common):,}",fontsize=15)
-    fig.tight_layout(rect=(0,0.025,1,0.975),h_pad=0.55,w_pad=0.15)
-    fig.savefig(path,dpi=180,bbox_inches="tight"); plt.close(fig)
-
-COMPARISON_PATH=Path(OUT)/"clasificacion.png"
-render_comparison(_xyz,_rgb,RESULT["labels"],RESULT["instance_id"],COMPARISON_PATH,CONFIG)
-print("Comparación original/clasificación guardada en",COMPARISON_PATH)

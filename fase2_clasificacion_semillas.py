@@ -1,4 +1,6 @@
-"""Train a local-feature classifier from sparse, human-labeled point seeds."""
+# FASE 2 - CLASIFICACIÓN CON SEMILLAS ======================================
+
+"""Entrena un clasificador local con anotaciones humanas dispersas."""
 from pathlib import Path
 import csv
 import json
@@ -10,13 +12,17 @@ from sklearn.cluster import DBSCAN
 from sklearn.ensemble import ExtraTreesClassifier
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from sklearn.model_selection import GroupKFold, cross_val_predict
+from preview_renderer import render_preview
+
+# 1. CONFIGURACIÓN Y RUTAS ===================================================
 
 ROOT = Path(__file__).resolve().parent
 SEEDS = ROOT / "seed_annotations.csv"
-SOURCE = ROOT / "fábrica.ply"
-INPUT = ROOT / "results" / "ply_by_class.ply"
-OUTPUT = ROOT / "results" / "ply_seed_model.ply"
-STATS = ROOT / "results" / "seed_model_stats.json"
+SOURCE = ROOT / "fabrica_puntos.ply"
+INPUT = ROOT / "results" / "fase1_clasificacion.ply"
+OUTPUT = ROOT / "results" / "fase2_clasificacion.ply"
+STATS = ROOT / "results" / "fase2_estadisticas.json"
+PREVIEW = ROOT / "results" / "fase2_comparacion.png"
 
 CLASSES = ("piso", "tuberia", "viga", "persona", "maquina_vehiculo")
 RGB_BY_CLASS = {
@@ -31,9 +37,10 @@ CANDIDATE_RGB = np.array([RGB_BY_CLASS[c] for c in CANDIDATE_CLASSES], dtype=np.
 SEED_EXPANSION_RADIUS = 0.30
 SEED_NORMAL_AGREEMENT = 0.82
 
+# 2. CARACTERÍSTICAS LOCALES ================================================
 
 def local_features(points, normals, colors, k=40, batch=20000):
-    """Translation- and scale-independent local shape, normal, and color descriptors."""
+    """Calcula descriptores locales de forma, normales y color independientes de posición y escala."""
     tree = cKDTree(points)
     result = np.empty((len(points), 22), dtype=np.float32)
     for lo in range(0, len(points), batch):
@@ -54,6 +61,7 @@ def local_features(points, normals, colors, k=40, batch=20000):
         ))
     return result
 
+# 3. LECTURA DE ANOTACIONES =================================================
 
 def read_seeds(points, tree):
     rows = list(csv.DictReader(SEEDS.open(encoding="utf-8")))
@@ -66,6 +74,8 @@ def read_seeds(points, tree):
         raise ValueError(f"Una anotación no coincide con el PLY (distancia máxima {np.max(dist):.3f} m).")
     return rows, coords, labels, index, dist
 
+
+# 4. VALIDACIÓN ESPACIAL Y ENTRENAMIENTO ====================================
 
 def main():
     source = o3d.io.read_point_cloud(str(SOURCE))
@@ -84,7 +94,7 @@ def main():
     rows, seed_xyz, seed_y, seed_ix, seed_dist = read_seeds(points, tree)
     seed_x = features[seed_ix]
 
-    # Spatially grouped validation prevents nearby clicks from landing in both folds.
+    # La validación agrupada evita que clics cercanos queden en ambos conjuntos.
     groups = DBSCAN(eps=0.60, min_samples=1).fit_predict(seed_xyz)
     n_splits = min(5, len(np.unique(groups)))
     model = ExtraTreesClassifier(
@@ -96,8 +106,8 @@ def main():
         cv_pred = cross_val_predict(model, seed_x, seed_y, groups=groups, cv=cv, n_jobs=1)
     else:
         cv_pred = np.full_like(seed_y, "sin_validacion")
-    # Expand each click only along its nearby surface, using normal agreement to avoid
-    # crossing from a pipe to an adjacent beam at a junction.
+    # Expande cada clic sobre la superficie cercana y usa acuerdo de normales para
+    # evitar cruzar desde una tubería hacia una viga adyacente en una unión.
     expanded_labels = {}
     for seed_id, (seed_index, seed_class) in enumerate(zip(seed_ix, seed_y)):
         neighborhood = tree.query_ball_point(points[seed_index], r=SEED_EXPANSION_RADIUS)
@@ -111,6 +121,8 @@ def main():
     train_ix = np.fromiter(expanded_labels.keys(), dtype=int)
     train_y = np.array([expanded_labels[int(i)][0] for i in train_ix])
     model.fit(features[train_ix], train_y)
+
+# 5. PREDICCIÓN Y EXPORTACIÓN ===============================================
 
     candidates = np.any(np.all(base_rgb[:, None, :] == CANDIDATE_RGB[None, :, :], axis=2), axis=1)
     probabilities = model.predict_proba(features[candidates])
@@ -128,12 +140,18 @@ def main():
         class_to_rgb[c] for c in train_y
     ]), axis=1)]
     out_rgb[train_ix] = np.stack([class_to_rgb[c] for c in train_y])
-    # Preserve the manually confirmed seed points as the labels that supervised training.
+    # Conserva las semillas confirmadas manualmente como etiquetas supervisadas.
     out_rgb[seed_ix] = np.stack([class_to_rgb[c] for c in seed_y])
     changed_count = int(np.sum(np.any(out_rgb != base_rgb, axis=1)))
     out = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
     out.colors = o3d.utility.Vector3dVector(out_rgb.astype(float) / 255)
     o3d.io.write_point_cloud(str(OUTPUT), out, write_ascii=False)
+    render_preview(
+        points, out_rgb, RGB_BY_CLASS,
+        f"Modelo supervisado con semillas dispersas — {len(points):,} puntos", PREVIEW,
+    )
+
+# 6. MÉTRICAS Y RESULTADOS ==================================================
 
     cv_report = classification_report(seed_y, cv_pred, labels=CLASSES, output_dict=True, zero_division=0)
     counts = {name: int(np.sum(np.all(out_rgb == rgb, axis=1))) for name, rgb in RGB_BY_CLASS.items()}
@@ -156,16 +174,19 @@ def main():
         "feature_names": ["abs_normal_xyz", "rgb", "local_covariance_eigenvalue_ratios",
                           "neighbor_abs_normal_mean", "neighbor_abs_normal_std",
                           "neighbor_rgb_mean", "neighbor_rgb_std", "knn_radius"],
-        "note": "Sparse human seed labels; grouped CV is only a small-sample diagnostic, not full-scene ground truth.",
+        "note": "Etiquetas humanas dispersas; la validación agrupada es solo un diagnóstico de muestra pequeña, no verdad de suelo para toda la escena.",
         "output": str(OUTPUT),
+        "preview": str(PREVIEW),
     }
     STATS.write_text(json.dumps(stats, indent=2), encoding="utf-8")
-    print("Seed labels:", stats["seed_counts"])
-    print("Spatially grouped seed CV accuracy:", round(stats["spatial_grouped_cv_accuracy"], 3))
-    print("Candidate points:", stats["candidate_points"], "reclassified:", stats["reclassified_points"])
-    print("Output:", OUTPUT)
-    print("Stats:", STATS)
+    print("Semillas por clase:", stats["seed_counts"])
+    print("Precisión CV espacialmente agrupada:", round(stats["spatial_grouped_cv_accuracy"], 3))
+    print("Puntos candidatos:", stats["candidate_points"], "reclasificados:", stats["reclassified_points"])
+    print("Salida:", OUTPUT)
+    print("Estadísticas:", STATS)
+    print("Comparación:", PREVIEW)
 
+# 7. EJECUCIÓN =============================================================
 
 if __name__ == "__main__":
     main()
