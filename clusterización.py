@@ -154,3 +154,17 @@ def voxel_attributes(n_vox, mapping, rgb, normals):
         vnor /= np.maximum(np.linalg.norm(vnor, axis=1, keepdims=True), 1e-12)
     return vrgb, vnor
 
+# 5. MÓDULO DE COLOR: MEAN-SHIFT ==============================================
+
+def color_module(xyz_vox, vrgb, config, rng):
+    """[COLOR] Mean-Shift (compañero 3): se ajusta con una muestra submuestreada por vóxel y se predice para todos."""
+    pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(xyz_vox)); pc.colors = o3d.utility.Vector3dVector(vrgb)
+    sample = np.asarray(pc.voxel_down_sample(config["MS_VOXEL"]).colors)
+    if len(sample) > config["MS_FIT_MAX"]: sample = sample[rng.choice(len(sample), config["MS_FIT_MAX"], replace=False)]
+    bw = estimate_bandwidth(sample, quantile=config["MS_QUANTILE"], n_samples=2000, random_state=config["SEED"])
+    ms = MeanShift(bandwidth=max(bw, 1e-3), bin_seeding=True, cluster_all=True, n_jobs=-1).fit(sample)
+    C = ms.cluster_centers_; g = C.mean(1); chroma = C - g[:, None]
+
+    cdist = np.sqrt(((chroma[:, None] - chroma[None]) ** 2).sum(-1) + (config["COLOR_LIGHT_WEIGHT"] * (g[:, None] - g[None])) ** 2)
+    return ms.predict(vrgb), C, cdist
+
