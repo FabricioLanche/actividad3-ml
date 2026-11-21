@@ -1,0 +1,140 @@
+{
+  "seed_count": 128,
+  "seed_counts": {
+    "piso": 28,
+    "tuberia": 29,
+    "viga": 46,
+    "persona": 15,
+    "maquina_vehiculo": 10
+  },
+  "expanded_training_points": 9446,
+  "seed_expansion_radius_m": 0.3,
+  "seed_normal_agreement": 0.82,
+  "spatial_groups": 102,
+  "spatial_grouped_cv_accuracy": 0.8046875,
+  "spatial_grouped_cv_report": {
+    "piso": {
+      "precision": 0.92,
+      "recall": 0.8214285714285714,
+      "f1-score": 0.8679245283018868,
+      "support": 28.0
+    },
+    "tuberia": {
+      "precision": 0.9285714285714286,
+      "recall": 0.896551724137931,
+      "f1-score": 0.9122807017543859,
+      "support": 29.0
+    },
+    "viga": {
+      "precision": 0.7288135593220338,
+      "recall": 0.9347826086956522,
+      "f1-score": 0.819047619047619,
+      "support": 46.0
+    },
+    "persona": {
+      "precision": 0.6666666666666666,
+      "recall": 0.26666666666666666,
+      "f1-score": 0.38095238095238093,
+      "support": 15.0
+    },
+    "maquina_vehiculo": {
+      "precision": 0.7,
+      "recall": 0.7,
+      "f1-score": 0.7,
+      "support": 10.0
+    },
+    "accuracy": 0.8046875,
+    "macro avg": {
+      "precision": 0.7888103309120258,
+      "recall": 0.7238859141857642,
+      "f1-score": 0.7360410460112545,
+      "support": 128.0
+    },
+    "weighted avg": {
+      "precision": 0.8063593371670703,
+      "recall": 0.8046875,
+      "f1-score": 0.790222682295361,
+      "support": 128.0
+    }
+  },
+  "spatial_grouped_cv_confusion_matrix": [
+    [
+      23,
+      0,
+      4,
+      0,
+      1
+    ],
+    [
+      0,
+      26,
+      2,
+      1,
+      0
+    ],
+    [
+      1,
+      1,
+      43,
+      0,
+      1
+    ],
+    [
+      0,
+      1,
+      9,
+      4,
+      1
+    ],
+    [
+      1,
+      0,
+      1,
+      1,
+      7
+    ]
+  ],
+  "cv_class_order": [
+    "piso",
+    "tuberia",
+    "viga",
+    "persona",
+    "maquina_vehiculo"
+  ],
+  "max_seed_snap_distance_m": 0.0007632970748446094,
+  "candidate_points": 576380,
+  "accepted_predictions": 349048,
+  "candidate_classes": [
+    "piso",
+    "tuberia",
+    "viga",
+    "persona",
+    "maquina_vehiculo",
+    "otro"
+  ],
+  "reclassified_points": 125651,
+  "locally_propagated_points": 849,
+  "confidence_threshold": 0.8,
+  "output_points_per_class": {
+    "piso": 237273,
+    "tuberia": 93278,
+    "viga": 165555,
+    "techo": 83927,
+    "columna": 162354,
+    "persona": 7546,
+    "maquina_vehiculo": 20177,
+    "otro": 53400
+  },
+  "feature_names": [
+    "abs_normal_xyz",
+    "rgb",
+    "local_covariance_eigenvalue_ratios",
+    "neighbor_abs_normal_mean",
+    "neighbor_abs_normal_std",
+    "neighbor_rgb_mean",
+    "neighbor_rgb_std",
+    "knn_radius"
+  ],
+  "note": "Sparse human seed labels; grouped CV is only a small-sample diagnostic, not full-scene ground truth.",
+  "output": "/home/bricafio/Escritorio/actividad3-ml/results/ply_seed_model.ply"
+}
