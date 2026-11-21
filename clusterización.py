@@ -168,3 +168,63 @@ def color_module(xyz_vox, vrgb, config, rng):
     cdist = np.sqrt(((chroma[:, None] - chroma[None]) ** 2).sum(-1) + (config["COLOR_LIGHT_WEIGHT"] * (g[:, None] - g[None])) ** 2)
     return ms.predict(vrgb), C, cdist
 
+# 6. REGION GROWING POR NORMALES Y COLOR ======================================
+
+def region_growing_normales(points, normals, max_angle_deg=12.0, radius=0.08, min_cluster_size=40, cid=None, cdist=None, color_cut=None):
+    """[NORMAS] Region growing por continuidad angular (compañero 2): arista si arccos(|n1.n2|)<=ángulo.
+    [COLOR] Si se da cid/cdist, la arista además exige que la distancia de color entre sus clases sea <= color_cut."""
+    n = len(points)
+    if n == 0: return np.array([], dtype=int)
+    normals = normals / (np.linalg.norm(normals, axis=1, keepdims=True) + 1e-12)
+    pairs = cKDTree(points).query_pairs(r=radius, output_type="ndarray")
+    if len(pairs) == 0: return np.full(n, -1, dtype=int)
+    ok = np.abs(np.sum(normals[pairs[:, 0]] * normals[pairs[:, 1]], axis=1)) >= np.cos(np.radians(max_angle_deg))
+    if cid is not None and cdist is not None and color_cut is not None:
+        ok &= cdist[cid[pairs[:, 0]], cid[pairs[:, 1]]] <= color_cut
+    valid = pairs[ok]
+    rows = np.concatenate([valid[:, 0], valid[:, 1]]); cols = np.concatenate([valid[:, 1], valid[:, 0]])
+    adj = csr_matrix((np.ones(len(rows), dtype=np.int8), (rows, cols)), shape=(n, n))
+    n_comp, raw = connected_components(adj, directed=False)
+    counts = np.bincount(raw); good = np.where(counts >= min_cluster_size)[0]
+    remap = np.full(n_comp, -1, dtype=int); remap[good] = np.arange(len(good))
+    return remap[raw]
+
+def split_with_normals_and_color(points, normals, config, cid, cdist):
+    """[NORMAS][COLOR] Region growing sobre un cluster. Devuelve etiquetas de segmento (-1 = remanente) o None si las
+    normales son demasiado ruidosas (cobertura < RG_MIN_COVER). Los fragmentos < RG_MIN se adhieren al segmento más cercano."""
+    sub = region_growing_normales(points, normals, config["RG_ANGLE"], config["_RG_RADIUS"], config["RG_MIN"],
+                                  cid, cdist, config["COLOR_CUT"] if cid is not None else None)
+    good = sub >= 0
+    if not good.any() or good.mean() < config["RG_MIN_COVER"]: return None
+    if (~good).any():
+        d_, nn_ = cKDTree(points[good]).query(points[~good], distance_upper_bound=2 * config["_RG_RADIUS"], workers=-1)
+        hit = np.isfinite(d_); loc = np.flatnonzero(~good); sub = sub.copy()
+        sub[loc[hit]] = sub[np.flatnonzero(good)[nn_[hit]]]
+    return sub
+
+def resolve_unclassified(ix, vox, vn, cid, cdist, floor_z, cfg, rng, vlabels, instance, next_inst):
+    """[NORMAS][COLOR] Segunda oportunidad: un cluster que las reglas dejaron como "otro" se subdivide con region growing
+    (normales + color) y cada segmento se reclasifica con las MISMAS reglas. Solo puede convertir "otro" en otra clase;
+    lo ya clasificado por el compañero 1 no se toca."""
+    sub = split_with_normals_and_color(vox[ix], vn[ix], cfg, None if cid is None else cid[ix], cdist)
+    if sub is None: return next_inst
+    for sl in np.unique(sub[sub >= 0]):
+        jx = ix[sub == sl]
+        if len(jx) < cfg["TINY_POINTS"]: continue
+        cl = classify_features(cluster_features(vox[jx], vn[jx], floor_z, cfg, rng), cfg)
+        if cl == 8: continue
+        vlabels[jx] = cl; instance[jx] = next_inst; next_inst += 1
+    return next_inst
+
+def refine_pipe_segments(ix, vox, vn, cid, cdist, floor_z, cfg, rng, vlabels, instance, next_inst):
+    """Busca subsegmentos cilíndricos dentro de grupos inicialmente clasificados como viga/otro."""
+    sub = split_with_normals_and_color(vox[ix], vn[ix], cfg, None if cid is None else cid[ix], cdist)
+    if sub is None: return next_inst
+    for sl in np.unique(sub[sub >= 0]):
+        jx = ix[sub == sl]
+        if len(jx) < cfg["TINY_POINTS"]: continue
+        f = cluster_features(vox[jx], vn[jx], floor_z, cfg, rng)
+        if f["cilindro"]["ok"] and f["verticalidad"] < cfg["COLUMN_VERTICALITY"]:
+            vlabels[jx] = 4; instance[jx] = next_inst; next_inst += 1
+    return next_inst
+
