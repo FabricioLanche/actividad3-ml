@@ -120,3 +120,37 @@ def class_colors(labels):
     color[ok]=COLORS[labels[ok]]
     return color
 
+# 4. ATRIBUTOS POR VÓXEL: NORMALES Y COLOR ====================================
+
+def estimate_normals(xyz, provided, config):
+    """Usa las normales válidas del archivo y estima desde XYZ las ausentes o inválidas."""
+    n = np.asarray(provided, dtype=float) if (config["USE_FILE_NORMALS"] and provided is not None and len(provided)==len(xyz)) else None
+    if n is not None:
+        good = np.isfinite(n).all(axis=1) & (np.linalg.norm(n,axis=1)>1e-8)
+        if good.all(): return n / np.linalg.norm(n,axis=1,keepdims=True)
+    pc = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(xyz))
+    pc.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=max(3*config["VOXEL"],.12), max_nn=30))
+    est = np.asarray(pc.normals)
+    if n is None: return est / np.maximum(np.linalg.norm(est,axis=1,keepdims=True),1e-12)
+    out = est.copy(); out[good] = n[good] / np.linalg.norm(n[good],axis=1,keepdims=True)
+    return out
+
+def check_up_axis(xyz, normals, config):
+    axis = config["UP_AXIS"]
+    med = np.nanmedian(np.abs(normals),axis=0)
+    if axis != 2 or med[2] < 0.35:
+        warnings.warn(f"El eje UP_AXIS={axis} puede no ser vertical (mediana |normal|={med.round(2)}). Revisa el eje y rota XYZ si hace falta.")
+
+def voxel_attributes(n_vox, mapping, rgb, normals):
+    """[NORMAS][COLOR] Promedia RGB y normales del archivo por vóxel (las normales se alinean al signo de la primera)."""
+    lens = np.array([len(m) for m in mapping]); flat = np.concatenate(mapping); vid = np.repeat(np.arange(n_vox), lens)
+    cnt = np.maximum(lens, 1).astype(float); vrgb = vnor = None
+    if rgb is not None:
+        vrgb = np.stack([np.bincount(vid, rgb[flat, j], n_vox) / cnt for j in range(3)], 1)
+    if normals is not None:
+        first = np.r_[0, np.cumsum(lens)[:-1]]; ref = normals[flat[first]]
+        sgn = np.sign(np.einsum("ij,ij->i", normals[flat], ref[vid])); sgn[sgn == 0] = 1
+        vnor = np.stack([np.bincount(vid, normals[flat, j] * sgn, n_vox) / cnt for j in range(3)], 1)
+        vnor /= np.maximum(np.linalg.norm(vnor, axis=1, keepdims=True), 1e-12)
+    return vrgb, vnor
+
