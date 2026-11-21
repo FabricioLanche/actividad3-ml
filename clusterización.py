@@ -304,3 +304,71 @@ def detect_columns(vox, excluded, floor_z, ceil_z, config):
     out[(~excluded) & (cid >= 0)] = cid[(~excluded) & (cid >= 0)]
     return out, kept
 
+# 8. EXTRACCIÓN DE PLANOS CON RANSAC ==========================================
+
+def dbscan_labels(points, eps, min_samples):
+    if len(points)==0: return np.empty(0,dtype=int)
+    return DBSCAN(eps=float(eps),min_samples=int(min_samples),n_jobs=-1).fit_predict(points)
+
+def extract_planes(xyz, normals, excluded, config):
+    """Extrae planos RANSAC iterativos y separa cada plano en piezas conectadas."""
+    remaining=np.flatnonzero(~excluded); plane_ids=np.full(len(xyz),-1,int); next_id=0
+    cloud=o3d.geometry.PointCloud(o3d.utility.Vector3dVector(xyz))
+    for _ in range(config["MAX_PLANES"]):
+        if len(remaining)<config["MIN_PLANE_POINTS"]: break
+        sub=cloud.select_by_index(remaining.tolist())
+        model,inliers=sub.segment_plane(config["PLANE_DIST"],3,config["PLANE_ITERS"],.999)
+        if len(inliers)<config["MIN_PLANE_POINTS"]: break
+        ids=remaining[np.asarray(inliers,dtype=int)]
+        local=dbscan_labels(xyz[ids],config["PLANE_PIECE_EPS"],max(5,config["DBSCAN_MIN"]))
+        for lab in np.unique(local):
+            piece=ids[local==lab]
+            if len(piece)>=config["TINY_POINTS"]:
+                plane_ids[piece]=next_id; next_id+=1
+        mask=np.ones(len(remaining),bool); mask[np.asarray(inliers,dtype=int)]=False
+        remaining=remaining[mask]
+    return plane_ids
+
+# 9. CLUSTERIZACIÓN DEL RESIDUO ===============================================
+
+def adaptive_eps(points, config, rng):
+    if len(points)<3: return config["ETA"]*config["VOXEL"]
+    take=rng.choice(len(points),min(config["KNN_SAMPLE"],len(points)),replace=False)
+    k=min(config["KNN_K"]+1,len(points))
+    d,_=cKDTree(points).query(points[take],k=k,workers=-1)
+    kth=d[:,-1] if d.ndim==2 else d
+    med=float(np.median(kth[np.isfinite(kth)]))
+    return max(config["VOXEL"],config["ETA"]*med)
+
+def cluster_residual(points, normals, config, rng):
+    """Agrupa residuo; los bloques gigantes se subdividen por orientación y escala."""
+    method=config["RESIDUAL_METHOD"].lower()
+    eps=adaptive_eps(points,config,rng)
+    if method=="dbscan": labels=dbscan_labels(points,eps,config["DBSCAN_MIN"])
+    elif method=="kmeans": labels=KMeans(n_clusters=min(config["ALT_CLUSTER_COUNT"],len(points)),random_state=SEED,n_init=5).fit_predict(points)
+    elif method=="gmm": labels=GaussianMixture(n_components=min(config["ALT_CLUSTER_COUNT"],len(points)),random_state=SEED).fit_predict(points)
+    elif method=="hdbscan":
+        try:
+            from sklearn.cluster import HDBSCAN
+        except ImportError as e: raise RuntimeError("HDBSCAN no está disponible en esta versión de scikit-learn.") from e
+        labels=HDBSCAN(min_cluster_size=max(10,config["DBSCAN_MIN"])).fit_predict(points)
+    else: raise ValueError("RESIDUAL_METHOD debe ser dbscan, hdbscan, kmeans o gmm.")
+    valid=labels>=0
+    if valid.any():
+        ids,counts=np.unique(labels[valid],return_counts=True); giant=ids[np.argmax(counts)]
+        if counts.max()/len(points)>config["GIANT_FRACTION"]:
+            gidx=np.flatnonzero(labels==giant); nz=np.abs(normals[gidx,config["UP_AXIS"]])
+            fam=np.where(nz>.85,0,np.where(nz<.25,1,2))
+            new=labels.copy(); next_id=int(labels.max())+1
+            for family in range(3):
+                ix=gidx[fam==family]
+                if len(ix)<config["DBSCAN_MIN"]: continue
+                sub=dbscan_labels(points[ix],eps*config["GIANT_ETA_FACTOR"],config["DBSCAN_MIN"])
+                for sl in np.unique(sub):
+                    if sl<0: continue
+                    si=ix[sub==sl]
+                    if len(si)>=config["TINY_POINTS"]: new[si]=next_id; next_id+=1
+                    else: new[si]=-1
+            labels=new
+    return labels,eps
+
