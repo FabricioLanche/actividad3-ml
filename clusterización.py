@@ -428,3 +428,169 @@ def classify_features(f,config):
     if f["huella"]>=config["MACHINE_FOOTPRINT_MIN"] and f["altura"]<=config["MACHINE_HEIGHT_MAX"] and f["base_piso"]<=config["MACHINE_BASE_MAX"]: return 7
     return 8
 
+# 11. PIPELINE COMPLETO DE CLASIFICACIÓN ======================================
+
+def predict(xyz,rgb=None,normals=None,config=None):
+    """Devuelve etiquetas, ID de instancia y metadatos del pipeline por punto original."""
+    cfg=dict(CONFIG); cfg.update(config or {}); rng=np.random.default_rng(cfg["SEED"])
+    o3d.utility.random.seed(int(cfg["SEED"]))
+    xyz=np.asarray(xyz,float)
+    if xyz.ndim!=2 or xyz.shape[1]!=3: raise ValueError("xyz debe tener forma (N,3).")
+    started=time.perf_counter(); vox,mapping=timed("0_voxel",len(xyz),lambda:voxelize(xyz,cfg["VOXEL"]))
+    vrgb,vfile=timed("atributos_voxel",len(vox),lambda:voxel_attributes(len(vox),mapping,
+                     rgb if cfg["USE_COLOR"] else None, normals if cfg["USE_FILE_NORMALS"] else None))
+    vn=timed("normales",len(vox),lambda:estimate_normals(vox,vfile,cfg))
+    sp=cKDTree(vox).query(vox[rng.choice(len(vox),min(5000,len(vox)),replace=False)],k=2,workers=-1)[0][:,1]
+    cfg["_RG_RADIUS"]=max(cfg["RG_RADIUS_MIN"],cfg["RG_RADIUS_FACTOR"]*float(np.median(sp)))
+    cid=centers=cdist=None
+    if cfg["USE_COLOR"] and vrgb is not None and cfg["USE_RG"]:
+        (cid,centers,cdist)=timed("color_meanshift",len(vox),lambda:color_module(vox,vrgb,cfg,rng))
+    check_up_axis(vox,vn,cfg)
+    floor,ceiling,fz,cz,floor_levels=timed("1_piso_techo",len(vox),lambda:detect_floor_ceiling(vox,vn,cfg))
+    excluded=floor|ceiling
+    vlabels=np.full(len(vox),-1,int); instance=np.full(len(vox),-1,int); next_inst=0; n_cols=0
+    if cfg["USE_COLUMN_STAGE"]:   # [COLUMNAS] se detectan antes de RANSAC/clusters para que ningún paso las absorba
+        col_id,n_cols=timed("1b_columnas",int((~excluded).sum()),lambda:detect_columns(vox,excluded,fz,cz,cfg))
+        is_col=col_id>=0; vlabels[is_col]=3; instance[is_col]=col_id[is_col]; next_inst=n_cols
+        excluded=excluded|is_col
+    planes=timed("2_planos_ransac",int((~excluded).sum()),lambda:extract_planes(vox,vn,excluded,cfg))
+    vlabels[floor]=0; vlabels[ceiling]=1
+    for pid in np.unique(planes[planes>=0]):
+        ix=np.flatnonzero(planes==pid)
+        # Los planos horizontales intermedios son pisos de otros niveles/edificios.
+        # Los planos verticales permanecen como "otro" (no se reporta clase pared).
+        horizontal=float(np.median(np.abs(vn[ix,cfg["UP_AXIS"]]))) >= cfg["NORMAL_UP"]
+        plane_z=float(np.median(vox[ix,cfg["UP_AXIS"]]))
+        if horizontal:
+            zq=np.percentile(vox[ix,cfg["UP_AXIS"]],[5,95])
+            if zq[1]-zq[0]>cfg["FLOOR_PLANE_MAX_Z_SPREAD"]:
+                # La mediana puede coincidir con un nivel de piso aunque el segmento suba varios metros.
+                planes[ix]=-1
+                continue
+            ax=[i for i in range(3) if i!=cfg["UP_AXIS"]]
+            xy=vox[ix][:,ax]; side=np.ptp(xy,axis=0)
+            cell=cfg["FLOOR_PLANE_GRID"]
+            ij=np.floor((xy-xy.min(0))/cell).astype(int)
+            grid=ij.max(0)+1; occupied=np.zeros(grid,dtype=bool); occupied[ij[:,0],ij[:,1]]=True
+            coverage=float(occupied.mean())
+            broad=(min(side)>=cfg["FLOOR_PLANE_MIN_SIDE"] and np.prod(side)>=cfg["FLOOR_PLANE_MIN_AREA"]
+                   and coverage>=cfg["FLOOR_PLANE_MIN_OCCUPANCY"])
+            if not broad:
+                # Un parche horizontal angosto puede ser la cara superior de una tubería/viga.
+                # Devuélvelo al agrupamiento geométrico para que se evalúe su sección.
+                planes[ix]=-1
+                continue
+            if plane_z>=cz-cfg["CEILING_BAND"]:
+                vlabels[ix]=1
+            elif np.any(np.abs(floor_levels-plane_z)<=1.5*cfg["FLOOR_BAND"]):
+                # Un piso tiene soporte XY en los cuatro cuadrantes alrededor de cada celda.
+                # Una corona de tubería es una franja y no debe heredar la etiqueta piso.
+                quadrant_counts=[]
+                for rs,cs in ((slice(0,2),slice(0,2)),(slice(0,2),slice(3,5)),
+                              (slice(3,5),slice(0,2)),(slice(3,5),slice(3,5))):
+                    kernel=np.zeros((5,5),dtype=np.int8); kernel[rs,cs]=1
+                    quadrant_counts.append(convolve(occupied.astype(np.int8),kernel,mode="constant"))
+                supported=np.logical_and.reduce([
+                    q[ij[:,0],ij[:,1]]>=cfg["FLOOR_PLANE_QUADRANT_SUPPORT"] for q in quadrant_counts])
+                floor_ix=ix[supported]; pipe_ix=ix[~supported]
+                if len(floor_ix):
+                    vlabels[floor_ix]=0; instance[floor_ix]=next_inst; next_inst+=1
+                if len(pipe_ix): planes[pipe_ix]=-1
+                continue
+            else:
+                # Un plano horizontal fuera de los niveles de piso verificados puede ser una tubería/viga.
+                planes[ix]=-1
+                continue
+        else:
+            vlabels[ix]=8
+        instance[ix]=next_inst; next_inst+=1
+    residual=np.flatnonzero((~excluded)&(planes<0))
+    cluster_labels,eps=timed("3_residuo_cluster",len(residual),lambda:cluster_residual(vox[residual],vn[residual],cfg,rng))
+    clusters=np.unique(cluster_labels[cluster_labels>=0])
+    for lab in clusters:
+        loc=np.flatnonzero(cluster_labels==lab); ix=residual[loc]
+        if len(ix)<cfg["TINY_POINTS"]: continue
+        cl=classify_features(cluster_features(vox[ix],vn[ix],fz,cfg,rng),cfg)
+        vlabels[ix]=cl; instance[ix]=next_inst; next_inst+=1
+        if cl==8 and cfg["USE_RG"] and len(ix)>=cfg["REFINE_MIN_POINTS"]:
+            next_inst=resolve_unclassified(ix,vox,vn,cid,cdist,fz,cfg,rng,vlabels,instance,next_inst)
+        if cl in (5,8) and cfg["USE_RG"] and len(ix)>=cfg["REFINE_MIN_POINTS"]:
+            next_inst=refine_pipe_segments(ix,vox,vn,cid,cdist,fz,cfg,rng,vlabels,instance,next_inst)
+    if cfg["FILL_UNASSIGNED"]:
+        un=np.flatnonzero(vlabels<0); ok_=np.flatnonzero(vlabels>=0)
+        if len(un) and len(ok_):
+            d_,nn_=cKDTree(vox[ok_]).query(vox[un],distance_upper_bound=cfg["FILL_RADIUS"],workers=-1)
+            hit=np.isfinite(d_); dest=un[hit]; src_=ok_[nn_[hit]]
+            vertical_ok=(~np.isin(vlabels[src_],[0,1]) |
+                         (np.abs(vox[dest,cfg["UP_AXIS"]]-vox[src_,cfg["UP_AXIS"]])<=cfg["FILL_VERTICAL_TOL"]))
+            dest=dest[vertical_ok]; src_=src_[vertical_ok]
+            vlabels[dest]=vlabels[src_]; instance[dest]=instance[src_]
+        # Completa puntos aislados sin propagar piso/techo a otra altura.
+        un=np.flatnonzero(vlabels<0); ok_=np.flatnonzero(vlabels>=0)
+        if len(un) and len(ok_):
+            usable=ok_[~np.isin(vlabels[ok_],[0,1])]
+            if len(usable):
+                _,nn_=cKDTree(vox[usable]).query(vox[un],k=1,workers=-1)
+                vlabels[un]=vlabels[usable[nn_]]; instance[un]=instance[usable[nn_]]
+            else:
+                vlabels[un]=8; instance[un]=next_inst; next_inst+=1
+
+    outlab=np.full(len(xyz),-1,int); outinst=np.full(len(xyz),-1,int)
+    mapped=np.zeros(len(xyz),bool)
+    for vi,orig in enumerate(mapping):
+        orig=orig[(orig>=0)&(orig<len(xyz))]
+        outlab[orig]=vlabels[vi]; outinst[orig]=instance[vi]; mapped[orig]=True
+    missing=np.flatnonzero(~mapped)
+    if len(missing):
+        _,nn=cKDTree(vox).query(xyz[missing],k=1,workers=-1)
+        outlab[missing]=vlabels[nn]; outinst[missing]=instance[nn]
+    # Limpia manchas elevadas ya expandidas al PLY cuando están rodeadas por tubería.
+    raised=np.flatnonzero((outlab==0)&(xyz[:,cfg["UP_AXIS"]]>fz+2*cfg["FLOOR_BAND"]))
+    pipes=np.flatnonzero(outlab==4); reassigned=0
+    if len(raised) and len(pipes):
+        local=cKDTree(xyz).query_ball_point(xyz[raised],r=cfg["FLOOR_PIPE_REASSIGN_RADIUS"])
+        n_pipe=np.fromiter((np.sum(outlab[np.asarray(ids,dtype=int)]==4) for ids in local),dtype=int,count=len(local))
+        n_all=np.fromiter((len(ids) for ids in local),dtype=int,count=len(local))
+        promote=(n_pipe>=3)&(n_pipe/np.maximum(n_all,1)>=cfg["FLOOR_PIPE_REASSIGN_SHARE"])
+        ix=raised[promote]
+        if len(ix):
+            _,nn=cKDTree(xyz[pipes]).query(xyz[ix],k=1,workers=-1)
+            outlab[ix]=4; outinst[ix]=outinst[pipes[nn]]; reassigned=int(len(ix))
+    TIMINGS.append({"etapa":"total","segundos":time.perf_counter()-started,"puntos":len(xyz),"puntos_segundo":len(xyz)/max(time.perf_counter()-started,1e-9)})
+    return {"labels":outlab,"instance_id":outinst,"floor_z":fz,"floor_levels":floor_levels.tolist(),"ceiling_z":cz,"eps":eps,"color_centers":centers,"rg_radius":cfg.get("_RG_RADIUS"),"n_columns":n_cols,"floor_pipe_reassigned":reassigned}
+
+
+# 12. MÉTRICAS Y EXPORTACIÓN ==================================================
+
+def self_consistency(xyz,labels,config):
+    rng=np.random.default_rng(config["SEED"]); n=min(50000,len(xyz)); ix=rng.choice(len(xyz),n,replace=False)
+    k=min(11,len(xyz)); _,nn=cKDTree(xyz).query(xyz[ix],k=k,workers=-1)
+    neigh=labels[nn[:,1:]]; own=labels[ix]
+    disagree=np.mean(np.mean(neigh!=own[:,None],axis=1)>.5) if neigh.size else 0.
+    sizes=np.unique(labels[labels>=0],return_counts=True)[1]
+    return {"porcentaje_vecinos_mayoria_otra_clase":float(disagree*100),"porcentaje_sin_asignar":float(np.mean(labels<0)*100),
+            "segmentos_pequenos":int(np.sum(sizes<config["TINY_POINTS"])),"floor_below_ceiling":bool(RESULT["floor_z"]<RESULT["ceiling_z"]),
+            "floor_far_above_level":bool(np.any((labels==0)&(xyz[:,config["UP_AXIS"]]>RESULT["floor_z"]+config["FLOOR_BAND"]*2)))}
+
+def export_results(xyz,result,config):
+    out=Path(config["OUTPUT_DIR"]); out.mkdir(parents=True,exist_ok=True)
+    labels=result["labels"]; inst=result["instance_id"]
+    color=class_colors(labels)
+    pc=o3d.geometry.PointCloud(o3d.utility.Vector3dVector(xyz)); pc.colors=o3d.utility.Vector3dVector(color)
+    o3d.io.write_point_cloud(str(out/"ply_by_class.ply"),pc,write_ascii=False)
+    counts={CLASS_NAMES[c]:int(np.sum(labels==c)) for c in CLASS_NAMES}
+    sizes=np.unique(inst[inst>=0],return_counts=True)[1] if np.any(inst>=0) else np.array([],int)
+    stats={"points":len(xyz),"points_per_class":counts,"percent_unassigned":float(np.mean(labels<0)*100),
+           "cluster_size_distribution":{"min":int(sizes.min()) if sizes.size else 0,
+             "median":float(np.median(sizes)) if sizes.size else 0,"max":int(sizes.max()) if sizes.size else 0},
+           "tiny_segments":int(np.sum(sizes<config["TINY_POINTS"])),
+           "columns_detected":result.get("n_columns",0),"floor_z":result["floor_z"],"floor_levels":result.get("floor_levels",[result["floor_z"]]),"ceiling_z":result["ceiling_z"],"floor_pipe_reassigned":result.get("floor_pipe_reassigned",0),"adaptive_eps":result["eps"],"self_consistency":self_consistency(xyz,labels,config),"timings":TIMINGS,
+           "config":{"VOXEL":config["VOXEL"],"ETA":config["ETA"],"DBSCAN_MIN":config["DBSCAN_MIN"],
+                     "GIANT_FRACTION":config["GIANT_FRACTION"],"GIANT_ETA_FACTOR":config["GIANT_ETA_FACTOR"],
+                     "RESIDUAL_METHOD":config["RESIDUAL_METHOD"]},
+           "validation":"Reglas geométricas; no validado contra ground truth."}
+
+    (out/"stats.json").write_text(json.dumps(stats,ensure_ascii=False,indent=2),encoding="utf-8")
+    return out,stats
+
+
