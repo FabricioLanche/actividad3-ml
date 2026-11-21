@@ -268,3 +268,39 @@ def detect_floor_ceiling(xyz, normals, config):
     if floor_z>=ceil_z: warnings.warn("No se detectó piso por debajo del techo; revisar ejes y bandas.")
     return floor,ceiling,floor_z,ceil_z,np.asarray(floor_levels,float)
 
+# 7b. DETECCIÓN DE COLUMNAS POR CONTINUIDAD VERTICAL ===========================
+
+def detect_columns(vox, excluded, floor_z, ceil_z, config):
+    """[COLUMNAS] Una columna es una huella XY pequeña ocupada a lo largo de (casi) toda la altura del recinto.
+    Las vigas y tuberías horizontales ocupan pocos niveles z, las paredes tienen huellas largas y los tubos
+    verticales finos tienen huellas menores a COL_MIN_SIDE; la regla 'elongado + vertical' del clasificador
+    falla cuando la columna está pegada a vigas/tuberías porque el cluster deja de ser lineal.
+    Devuelve el id de columna por vóxel (-1 = ninguno)."""
+    up = config["UP_AXIS"]; ax = [i for i in range(3) if i != up]
+    cell, zb = config["COL_CELL"], config["COL_ZBIN"]
+    z = vox[:, up]; lo = floor_z + config["COL_Z_LOW"]; hi = ceil_z - config["COL_Z_HIGH"]
+    out = np.full(len(vox), -1, int)
+    use = (~excluded) & (z > lo) & (z < hi)
+    if use.sum() < 100 or hi <= lo: return out, 0
+    o = vox[:, ax].min(0)
+    ij = np.floor((vox[:, ax] - o) / cell).astype(int) + 2
+    sh = ij.max(0) + 3
+    zk = np.clip(np.floor((z - floor_z) / zb).astype(int), 0, None)
+    occ = np.zeros((sh[0], sh[1], zk.max() + 1), bool)
+    occ[ij[use, 0], ij[use, 1], zk[use]] = True
+    cover = occ.sum(2) / ((hi - lo) / zb)
+    mask = binary_closing(cover >= config["COL_MIN_OCC"], iterations=config["COL_CLOSE"])
+    lab, n = ndi_label(mask, structure=np.ones((3, 3)))
+    cellmap = np.full(lab.shape, -1, int); kept = 0
+    for c, sl in enumerate(find_objects(lab), start=1):
+        sub = lab[sl] == c
+        ex, ey = (sl[0].stop - sl[0].start) * cell, (sl[1].stop - sl[1].start) * cell
+        if min(ex, ey) < config["COL_MIN_THICK"] or not (config["COL_MIN_SIDE"] <= max(ex, ey) <= config["COL_MAX_SIDE"]): continue
+        if sub.mean() < config["COL_MIN_FILL"]: continue
+        cellmap[sl][sub] = kept; kept += 1
+    if kept == 0: return out, 0
+    if config["COL_PAD"] > 0: cellmap = maximum_filter(cellmap, size=2 * config["COL_PAD"] + 1)
+    cid = cellmap[ij[:, 0], ij[:, 1]]
+    out[(~excluded) & (cid >= 0)] = cid[(~excluded) & (cid >= 0)]
+    return out, kept
+
